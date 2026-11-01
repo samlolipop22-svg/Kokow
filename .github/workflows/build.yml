@@ -1,0 +1,517 @@
+name: Build Glass Launcher APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p glass && cd glass
+          mkdir -p app
+          cat > app/build.gradle.kts <<'GLASS_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.glass.launcher"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.glass.launcher"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.animation:animation")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.3")
+          }
+          GLASS_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'GLASS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:icon="@drawable/ic_banner"
+                  android:banner="@drawable/ic_banner"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.Glass">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:stateNotNeeded="true"
+                      android:resumeWhilePausing="true"
+                      android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|smallestScreenSize|screenLayout|uiMode|density|locale|layoutDirection">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          GLASS_EOF
+          mkdir -p app/src/main/java/com/glass/launcher
+          cat > app/src/main/java/com/glass/launcher/Apps.kt <<'GLASS_EOF'
+          package com.glass.launcher
+
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.core.graphics.drawable.toBitmap
+
+          data class AppEntry(
+              val label: String,
+              val pkg: String,
+              val component: ComponentName,
+              val image: ImageBitmap,
+              val isBanner: Boolean,
+          )
+
+          fun loadApps(pm: PackageManager, self: String): List<AppEntry> {
+              fun query(cat: String) =
+                  pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(cat), 0)
+
+              return (query(Intent.CATEGORY_LEANBACK_LAUNCHER) + query(Intent.CATEGORY_LAUNCHER))
+                  .distinctBy { it.activityInfo.packageName }
+                  .filter { it.activityInfo.packageName != self }
+                  .map { ri ->
+                      val ai = ri.activityInfo
+                      val banner = ai.loadBanner(pm)
+                      val drawable = banner ?: ai.loadIcon(pm)
+                      val bmp = if (banner != null) drawable.toBitmap(320, 180) else drawable.toBitmap(128, 128)
+                      AppEntry(
+                          label = ri.loadLabel(pm).toString(),
+                          pkg = ai.packageName,
+                          component = ComponentName(ai.packageName, ai.name),
+                          image = bmp.asImageBitmap(),
+                          isBanner = banner != null,
+                      )
+                  }
+                  .sortedBy { it.label.lowercase() }
+          }
+          GLASS_EOF
+          mkdir -p app/src/main/java/com/glass/launcher
+          cat > app/src/main/java/com/glass/launcher/LauncherScreen.kt <<'GLASS_EOF'
+          package com.glass.launcher
+
+          import androidx.compose.animation.AnimatedContent
+          import androidx.compose.animation.core.Animatable
+          import androidx.compose.animation.core.FastOutSlowInEasing
+          import androidx.compose.animation.core.LinearEasing
+          import androidx.compose.animation.core.RepeatMode
+          import androidx.compose.animation.core.animateFloat
+          import androidx.compose.animation.core.animateFloatAsState
+          import androidx.compose.animation.core.infiniteRepeatable
+          import androidx.compose.animation.core.rememberInfiniteTransition
+          import androidx.compose.animation.core.spring
+          import androidx.compose.animation.core.tween
+          import androidx.compose.animation.fadeIn
+          import androidx.compose.animation.fadeOut
+          import androidx.compose.animation.slideInVertically
+          import androidx.compose.animation.slideOutVertically
+          import androidx.compose.animation.togetherWith
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.ExperimentalFoundationApi
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.combinedClickable
+          import androidx.compose.foundation.interaction.MutableInteractionSource
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.lazy.itemsIndexed
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.BasicText
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.draw.drawWithContent
+          import androidx.compose.ui.draw.shadow
+          import androidx.compose.ui.focus.FocusRequester
+          import androidx.compose.ui.focus.focusRequester
+          import androidx.compose.ui.focus.onFocusChanged
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.Shape
+          import androidx.compose.ui.graphics.graphicsLayer
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.delay
+          import java.text.DateFormat
+          import java.text.SimpleDateFormat
+          import java.util.Calendar
+          import java.util.Date
+          import java.util.Locale
+
+          private val Glow = Color(0xFF9DB2FF)
+
+          /** Liquid-glass surface: frosted fill, bright rim light, specular highlight, optional light sweep. */
+          fun Modifier.glass(shape: Shape, focus: Float = 0f, sweep: Float = 0f): Modifier = this
+              .clip(shape)
+              .background(
+                  Brush.linearGradient(
+                      listOf(Color.White.copy(.15f + .12f * focus), Color.White.copy(.05f + .05f * focus))
+                  )
+              )
+              .border(
+                  1.dp,
+                  Brush.linearGradient(listOf(Color.White.copy(.8f), Color.White.copy(.06f), Color.White.copy(.4f))),
+                  shape
+              )
+              .drawWithContent {
+                  drawContent()
+                  drawRect(
+                      Brush.radialGradient(
+                          listOf(Color.White.copy(.24f), Color.Transparent),
+                          Offset(size.width * .15f, 0f),
+                          size.width * .9f
+                      )
+                  )
+                  if (sweep > 0f && sweep < 1f) {
+                      val cx = size.width * (-.3f + 1.6f * sweep)
+                      drawRect(
+                          Brush.linearGradient(
+                              listOf(Color.Transparent, Color.White.copy(.4f), Color.Transparent),
+                              Offset(cx - size.width * .2f, 0f),
+                              Offset(cx + size.width * .2f, size.height * .4f)
+                          )
+                      )
+                  }
+              }
+
+          @Composable
+          fun LauncherScreen(apps: List<AppEntry>, onOpen: (AppEntry) -> Unit, onInfo: (AppEntry) -> Unit) {
+              var focused by remember { mutableIntStateOf(0) }
+              val first = remember { FocusRequester() }
+              LaunchedEffect(apps.isNotEmpty()) {
+                  if (apps.isNotEmpty()) { delay(50); runCatching { first.requestFocus() } }
+              }
+
+              Box(Modifier.fillMaxSize().background(Color(0xFF05070F))) {
+                  Aurora(focused)
+                  Box(
+                      Modifier.fillMaxSize().background(
+                          Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(.65f)))
+                      )
+                  )
+                  Column(Modifier.fillMaxSize().padding(top = 36.dp, bottom = 24.dp)) {
+                      TopBar(Modifier.padding(horizontal = 64.dp))
+                      Spacer(Modifier.weight(1f))
+                      Hero(apps.getOrNull(focused)?.label ?: "", Modifier.padding(horizontal = 64.dp))
+                      LazyRow(
+                          contentPadding = PaddingValues(horizontal = 64.dp, vertical = 40.dp),
+                          horizontalArrangement = Arrangement.spacedBy(20.dp)
+                      ) {
+                          itemsIndexed(apps, key = { _, a -> a.component.flattenToString() }) { i, app ->
+                              AppTile(
+                                  app, i,
+                                  if (i == 0) Modifier.focusRequester(first) else Modifier,
+                                  onFocus = { focused = i },
+                                  onOpen = { onOpen(app) },
+                                  onInfo = { onInfo(app) }
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+
+          /** Slow drifting colour blobs; they parallax-shift as focus moves along the row. */
+          @Composable
+          private fun Aurora(focused: Int) {
+              val t = rememberInfiniteTransition(label = "aurora")
+              val p by t.animateFloat(
+                  initialValue = 0f, targetValue = 1f,
+                  animationSpec = infiniteRepeatable(tween(18000, easing = LinearEasing), RepeatMode.Reverse),
+                  label = "p"
+              )
+              val shift by animateFloatAsState(
+                  focused.coerceAtMost(12) * 50f, spring(dampingRatio = 0.8f, stiffness = 20f), label = "shift"
+              )
+              Canvas(Modifier.fillMaxSize()) {
+                  val w = size.width
+                  val h = size.height
+                  fun blob(c: Color, cx: Float, cy: Float, r: Float) = drawCircle(
+                      Brush.radialGradient(listOf(c.copy(alpha = .55f), Color.Transparent), Offset(cx, cy), r),
+                      r, Offset(cx, cy)
+                  )
+                  blob(Color(0xFF5B6CFF), w * (.2f + .15f * p) - shift, h * (.3f + .1f * p), w * .45f)
+                  blob(Color(0xFFFF4FA3), w * (.8f - .12f * p) - shift * .6f, h * (.25f + .15f * p), w * .4f)
+                  blob(Color(0xFF22D3EE), w * (.5f + .2f * p) - shift * .3f, h * (.85f - .1f * p), w * .5f)
+              }
+          }
+
+          @Composable
+          private fun Pill(content: @Composable () -> Unit) {
+              Box(Modifier.glass(RoundedCornerShape(50)).padding(horizontal = 28.dp, vertical = 14.dp)) { content() }
+          }
+
+          @Composable
+          private fun TopBar(modifier: Modifier = Modifier) {
+              var now by remember { mutableStateOf(Date()) }
+              LaunchedEffect(Unit) { while (true) { now = Date(); delay(15_000) } }
+              val hour = Calendar.getInstance().apply { time = now }.get(Calendar.HOUR_OF_DAY)
+              val greeting = when {
+                  hour < 5 -> "Good night"
+                  hour < 12 -> "Good morning"
+                  hour < 18 -> "Good afternoon"
+                  else -> "Good evening"
+              }
+              val style = TextStyle(color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Medium)
+              Row(modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+                  Pill { BasicText(greeting, style = style) }
+                  Pill {
+                      BasicText(
+                          DateFormat.getTimeInstance(DateFormat.SHORT).format(now) + "  ·  " +
+                              SimpleDateFormat("EEE d MMM", Locale.getDefault()).format(now),
+                          style = style
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun Hero(title: String, modifier: Modifier = Modifier) {
+              AnimatedContent(
+                  targetState = title,
+                  modifier = modifier.height(84.dp),
+                  contentAlignment = Alignment.CenterStart,
+                  transitionSpec = {
+                      (fadeIn(tween(350)) + slideInVertically(tween(350)) { it / 4 }) togetherWith
+                          (fadeOut(tween(200)) + slideOutVertically(tween(200)) { -it / 4 })
+                  },
+                  label = "hero"
+              ) { text ->
+                  BasicText(
+                      text, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                      style = TextStyle(color = Color.White, fontSize = 56.sp, fontWeight = FontWeight.Bold, letterSpacing = (-1).sp)
+                  )
+              }
+          }
+
+          @OptIn(ExperimentalFoundationApi::class)
+          @Composable
+          private fun AppTile(
+              app: AppEntry,
+              index: Int,
+              modifier: Modifier,
+              onFocus: () -> Unit,
+              onOpen: () -> Unit,
+              onInfo: () -> Unit,
+          ) {
+              var focused by remember { mutableStateOf(false) }
+              val scale by animateFloatAsState(
+                  if (focused) 1.14f else 1f, spring(dampingRatio = .55f, stiffness = 380f), label = "scale"
+              )
+              val f by animateFloatAsState(if (focused) 1f else 0f, tween(260), label = "f")
+              val sweep = remember { Animatable(0f) }
+              val enter = remember { Animatable(0f) }
+
+              LaunchedEffect(Unit) {
+                  delay(if (index < 8) index * 60L else 0L)
+                  enter.animateTo(1f, tween(600, easing = FastOutSlowInEasing))
+              }
+              LaunchedEffect(focused) {
+                  sweep.snapTo(0f)
+                  if (focused) sweep.animateTo(1f, tween(750, easing = FastOutSlowInEasing))
+              }
+
+              val shape = RoundedCornerShape(26.dp)
+              Column(
+                  Modifier
+                      .width(196.dp)
+                      .graphicsLayer {
+                          val s = scale
+                          scaleX = s; scaleY = s
+                          alpha = enter.value
+                          translationY = (1f - enter.value) * 80.dp.toPx() - 14.dp.toPx() * f
+                      },
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  Box(
+                      modifier
+                          .onFocusChanged { focused = it.isFocused; if (it.isFocused) onFocus() }
+                          .combinedClickable(
+                              interactionSource = remember { MutableInteractionSource() },
+                              indication = null,
+                              onLongClick = onInfo,
+                              onClick = onOpen
+                          )
+                          .size(196.dp, 110.dp)
+                          .shadow((30 * f).dp, shape, clip = false, ambientColor = Glow, spotColor = Glow)
+                          .glass(shape, f, sweep.value),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      if (app.isBanner) {
+                          Image(app.image, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                      } else {
+                          Image(app.image, null, Modifier.size(72.dp))
+                      }
+                  }
+                  BasicText(
+                      app.label, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                      modifier = Modifier.padding(top = 14.dp).graphicsLayer { alpha = .55f + .45f * f },
+                      style = TextStyle(color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Medium, textAlign = TextAlign.Center)
+                  )
+              }
+          }
+          GLASS_EOF
+          mkdir -p app/src/main/java/com/glass/launcher
+          cat > app/src/main/java/com/glass/launcher/MainActivity.kt <<'GLASS_EOF'
+          package com.glass.launcher
+
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.BackHandler
+          import androidx.activity.compose.setContent
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import androidx.lifecycle.lifecycleScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+
+          class MainActivity : ComponentActivity() {
+              private var apps by mutableStateOf<List<AppEntry>>(emptyList())
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      BackHandler {} // a launcher never "backs out"
+                      LauncherScreen(apps, onOpen = { openApp(it) }, onInfo = { showInfo(it) })
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  lifecycleScope.launch {
+                      apps = withContext(Dispatchers.Default) { loadApps(packageManager, packageName) }
+                  }
+              }
+
+              private fun openApp(app: AppEntry) {
+                  val i = Intent(Intent.ACTION_MAIN)
+                      .setComponent(app.component)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+                  runCatching { startActivity(i) }
+              }
+
+              private fun showInfo(app: AppEntry) {
+                  val i = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${app.pkg}"))
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  runCatching { startActivity(i) }
+              }
+          }
+          GLASS_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_banner.xml <<'GLASS_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="320dp" android:height="180dp"
+              android:viewportWidth="320" android:viewportHeight="180">
+              <path android:fillColor="#0B1020" android:pathData="M0,0h320v180h-320z" />
+              <path android:fillColor="#5B6CFF" android:fillAlpha="0.8" android:pathData="M110,90m-50,0a50,50 0,1 1,100 0a50,50 0,1 1,-100 0" />
+              <path android:fillColor="#FF4FA3" android:fillAlpha="0.7" android:pathData="M190,90m-50,0a50,50 0,1 1,100 0a50,50 0,1 1,-100 0" />
+          </vector>
+          GLASS_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'GLASS_EOF'
+          <resources><string name="app_name">Glass Launcher</string></resources>
+          GLASS_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'GLASS_EOF'
+          <resources>
+              <style name="Theme.Glass" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@android:color/black</item>
+              </style>
+          </resources>
+          GLASS_EOF
+          mkdir -p .
+          cat > build.gradle.kts <<'GLASS_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          GLASS_EOF
+          mkdir -p .
+          cat > gradle.properties <<'GLASS_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          GLASS_EOF
+          mkdir -p .
+          cat > settings.gradle.kts <<'GLASS_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "GlassLauncher"
+          include(":app")
+          GLASS_EOF
+      - name: Build
+        run: cd glass && gradle assembleDebug
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: Glass Launcher APK ${{ github.run_number }}
+          files: glass/app/build/outputs/apk/debug/app-debug.apk
+
